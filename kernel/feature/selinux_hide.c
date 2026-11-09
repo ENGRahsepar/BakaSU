@@ -1072,124 +1072,244 @@ out:
 }
 
 /*
+ * Keep symbol lookup local to the hide parser. The build detects the actual
+ * symtab hash and table layout, including backports, rather than a version cut.
+ * Unknown hash implementations retain the kernel's native lookup.
+ */
+static void *selinux_hide_symtab_search(struct symtab *s, const char *key)
+{
+#if defined(KSU_COMPAT_SYMTAB_HASH_ROT4) || defined(KSU_COMPAT_SYMTAB_HASH_DJB2A)
+#ifdef KSU_COMPAT_HAS_NON_POINTER_SYMTAB_STRUCT
+    struct hashtab *h = &s->table;
+#else
+    struct hashtab *h = s->table;
+#endif
+    struct hashtab_node *node;
+#ifdef KSU_COMPAT_SYMTAB_HASH_DJB2A
+    const unsigned char *p;
+    unsigned int hash = 5381;
+#else
+    const char *p;
+    unsigned int hash = 0;
+#endif
+    int cmp;
+
+    if (!h || !h->size)
+        return NULL;
+
+#ifdef KSU_COMPAT_SYMTAB_HASH_DJB2A
+    /* Newer SELinux uses djb2a with unsigned bytes. */
+    for (p = (const unsigned char *)key; *p; p++)
+        hash = ((hash << 5) + hash) ^ *p;
+#else
+    /* Legacy symhash, including char signedness, without the strlen pass. */
+    for (p = key; *p; p++)
+        hash = (hash << 4 | (hash >> (8 * sizeof(unsigned int) - 4))) ^ *p;
+#endif
+    node = h->htable[hash & (h->size - 1)];
+    while (node) {
+#ifdef KSU_COMPAT_HAS_HASHTAB_KEY_PARAMS
+        /* Modern symtab uses strcmp; the table no longer stores callbacks. */
+        cmp = strcmp(key, node->key);
+#else
+        cmp = h->keycmp(h, key, node->key);
+#endif
+        if (!cmp)
+            return node->datum;
+        if (cmp < 0)
+            break;
+        node = node->next;
+    }
+    return NULL;
+#else
+    return symtab_search(s, key);
+#endif
+}
+
+/*
+ * Caller holds the live policy read lock/RCU protection. Cloned policies usually
+ * retain symbol values, but never assume that across reloads: verify the live
+ * canonical name at that value before using its indexed datum. Reordered IDs,
+ * aliases and missing indexed entries fall back to the live name lookup.
+ * No pointers or mappings are retained beyond the protected policy lifetime.
+ */
+static void *selinux_hide_lookup_live_symbol(struct policydb *pol, unsigned int sym, u32 value, const char *key)
+{
+    void *datum = NULL;
+    const char *name = NULL;
+
+    if (value && value <= pol->symtab[sym].nprim && pol->sym_val_to_name[sym])
+        name = sym_name(pol, sym, value - 1);
+    if (name && !strcmp(name, key)) {
+        switch (sym) {
+        case SYM_USERS:
+            if (pol->user_val_to_struct)
+                datum = pol->user_val_to_struct[value - 1];
+            break;
+        case SYM_ROLES:
+            if (pol->role_val_to_struct)
+                datum = pol->role_val_to_struct[value - 1];
+            break;
+        case SYM_TYPES:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_COMPAT_HAS_MODERN_POLICYDB)
+            if (pol->type_val_to_struct)
+                datum = pol->type_val_to_struct[value - 1];
+#else
+            if (pol->type_val_to_struct_array)
+                datum = flex_array_get_ptr(pol->type_val_to_struct_array, value - 1);
+#endif
+            break;
+        }
+        if (datum)
+            return datum;
+    }
+
+    return selinux_hide_symtab_search(&pol->symtab[sym], key);
+}
+
+/*
  * Caveat:  Mutates scontext.
  */
 static int string_to_context_struct(struct policydb *pol, struct policydb *orig_pol, struct sidtab *sidtabp,
-                                    struct sidtab *orig_sidtabp, char *scontext, char *orig_scontext, u32 scontext_len,
+                                    struct sidtab *orig_sidtabp, char *scontext, const char *source, u32 source_len,
                                     struct context *ctx, struct context *orig_ctx, u32 def_sid, int *orig_rc_p)
 {
     struct role_datum *role, *orig_role;
     struct type_datum *typdatum, *orig_typdatum;
     struct user_datum *usrdatum, *orig_usrdatum;
-    char *scontextp, *orig_scontextp, *p, *orig_p, oldc, orig_oldc;
-    int rc = 0, orig_rc = 0;
+    char *scontextp, *p, *user_name, *role_name, oldc;
+    bool orig_valid = true;
+    bool mls_started = false;
+    int rc = -EINVAL, orig_rc = -EINVAL;
 
     context_init(ctx);
     context_init(orig_ctx);
 
-    /* Parse the security context. */
-
-    orig_rc = rc = -EINVAL;
+    // split fields once
+    // Resolve backup names once; translate successful symbols to the protected live policy.
     scontextp = scontext;
-    orig_scontextp = orig_scontext;
+    user_name = scontextp;
 
     /* Extract the user. */
     p = scontextp;
-    orig_p = orig_scontextp;
-    while (*p && *p != ':') {
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
 
     if (*p == 0)
         goto out;
 
-    *orig_p++ = *p++ = 0;
+    *p++ = 0;
 
-    usrdatum = symtab_search(&pol->p_users, scontextp);
-    orig_usrdatum = symtab_search(&orig_pol->p_users, orig_scontextp);
+    usrdatum = selinux_hide_symtab_search(&pol->p_users, scontextp);
     if (!usrdatum)
         goto out;
 
     ctx->user = usrdatum->value;
-    if (orig_usrdatum)
-        orig_ctx->user = orig_usrdatum->value;
 
     /* Extract role. */
     scontextp = p;
-    orig_scontextp = orig_p;
-    while (*p && *p != ':') {
+    role_name = scontextp;
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
 
     if (*p == 0)
         goto out;
 
-    *orig_p++ = *p++ = 0;
+    *p++ = 0;
 
-    role = symtab_search(&pol->p_roles, scontextp);
-    orig_role = symtab_search(&orig_pol->p_roles, orig_scontextp);
+    role = selinux_hide_symtab_search(&pol->p_roles, scontextp);
     if (!role)
         goto out;
     ctx->role = role->value;
-    if (orig_role)
-        orig_ctx->role = orig_role->value;
 
     /* Extract type. */
     scontextp = p;
-    orig_scontextp = orig_p;
-    while (*p && *p != ':') {
+    while (*p && *p != ':')
         p++;
-        orig_p++;
-    }
     oldc = *p;
-    orig_oldc = *orig_p;
-    *orig_p++ = *p++ = 0;
+    *p++ = 0;
 
-    typdatum = symtab_search(&pol->p_types, scontextp);
-    orig_typdatum = symtab_search(&orig_pol->p_types, orig_scontextp);
+    typdatum = selinux_hide_symtab_search(&pol->p_types, scontextp);
     if (!typdatum || typdatum->attribute)
         goto out;
 
     ctx->type = typdatum->value;
+
+    /* Translate only successful backup symbols; rejected names need no live lookup. */
+    orig_usrdatum = selinux_hide_lookup_live_symbol(orig_pol, SYM_USERS, usrdatum->value, user_name);
+    if (orig_usrdatum)
+        orig_ctx->user = orig_usrdatum->value;
+    else
+        orig_valid = false;
+    orig_role = selinux_hide_lookup_live_symbol(orig_pol, SYM_ROLES, role->value, role_name);
+    if (orig_role)
+        orig_ctx->role = orig_role->value;
+    else
+        orig_valid = false;
+    orig_typdatum = selinux_hide_lookup_live_symbol(orig_pol, SYM_TYPES, typdatum->value, scontextp);
     if (orig_typdatum && !orig_typdatum->attribute)
         orig_ctx->type = orig_typdatum->value;
+    else
+        orig_valid = false;
 
+    mls_started = true;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) || defined(KSU_COMPAT_HAS_STRICTER_MLS_CONTEXT_TO_SID)
     rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
-    orig_rc = mls_context_to_sid(orig_pol, orig_oldc, orig_p, orig_ctx, orig_sidtabp, def_sid);
-#else
-    rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
-    if ((p - scontext) < scontext_len) {
-        orig_rc = rc = -EINVAL;
-        goto out;
-    }
+    if (orig_valid) {
+        if (oldc) {
+            size_t offset = p - scontext;
 
-    orig_rc = mls_context_to_sid(orig_pol, orig_oldc, &orig_p, orig_ctx, orig_sidtabp, def_sid);
-    if ((orig_p - orig_scontext) < scontext_len) {
-        orig_rc = rc = -EINVAL;
-        goto out;
+            // restore MLS suffix for live policy
+            memcpy(p, source + offset, source_len - offset);
+            p[source_len - offset] = '\0';
+        }
+        // validate live context with live policy
+        orig_rc = mls_context_to_sid(orig_pol, oldc, p, orig_ctx, orig_sidtabp, def_sid);
+        if (!orig_rc && !policydb_context_isvalid(orig_pol, orig_ctx))
+            orig_rc = -EINVAL;
+    }
+#else
+    // < 4.20: mls_context_to_sid() consumes the string through a char **
+    {
+        size_t mls_offset = p - scontext;
+
+        rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
+        if ((p - scontext) < source_len) {
+            rc = -EINVAL;
+            goto out;
+        }
+
+        if (orig_valid) {
+            char *orig_p;
+
+            if (oldc) {
+                // restore MLS suffix for live policy
+                memcpy(scontext + mls_offset, source + mls_offset, source_len - mls_offset);
+                scontext[source_len] = '\0';
+            }
+            orig_p = scontext + mls_offset;
+            orig_rc = mls_context_to_sid(orig_pol, oldc, &orig_p, orig_ctx, orig_sidtabp, def_sid);
+            if (!orig_rc && (orig_p - scontext) < source_len)
+                orig_rc = -EINVAL;
+            if (!orig_rc && !policydb_context_isvalid(orig_pol, orig_ctx))
+                orig_rc = -EINVAL;
+        }
     }
 #endif
-    if (rc) {
-        orig_rc = -EINVAL;
-        goto out;
-    }
-
-    /* Check the validity of the new context. */
-    orig_rc = rc = -EINVAL;
-
-    if (policydb_context_isvalid(pol, ctx)) {
-        rc = 0;
-    }
-    if (policydb_context_isvalid(orig_pol, orig_ctx)) {
-        orig_rc = 0;
-    }
+    if (!rc && !policydb_context_isvalid(pol, ctx))
+        rc = -EINVAL;
 out:
-    if (rc)
-        context_destroy(ctx);
-    if (orig_rc)
+    if (rc) {
+        /* Symbol parsing allocates no context resources; only MLS needs destruction. */
+        if (mls_started)
+            context_destroy(ctx);
+        else
+            ctx->user = ctx->role = ctx->type = 0;
+        // ignore live result if backup fails
+        orig_rc = -EINVAL;
+    }
+    /* Before MLS, an early failure leaves orig_ctx in its initial empty state. */
+    if ((rc || orig_rc) && mls_started)
         context_destroy(orig_ctx);
     *orig_rc_p = orig_rc;
     return rc;
@@ -1240,9 +1360,9 @@ static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct si
     struct policydb *policydb, *orig_policydb;
     struct sidtab *sidtab, *orig_sidtab;
 #endif
-    char *scontext2, *scontext3, *str = NULL;
+    char *scontext2;
     struct context context, orig_context;
-    int rc = 0, orig_rc = 0;
+    int rc = 0, orig_rc = -EINVAL;
     u32 orig_sid;
 
     /* An empty security context is never valid. */
@@ -1254,52 +1374,71 @@ static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct si
     if (!scontext2)
         return -ENOMEM;
 
-    scontext3 = kmemdup_nul(scontext, scontext_len, gfp_flags);
-    if (!scontext3) {
-        kfree(scontext2);
-        return -ENOMEM;
-    }
-
     // removed: if (!selinux_initialized())
     *sid = SECSID_NULL;
     if (orig_sid_p)
         *orig_sid_p = SECSID_NULL;
 
-        // removed: if (force)
+    // removed: if (force)
+retry:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     rcu_read_lock();
+    policydb = &policy->policydb;
+    sidtab = policy->sidtab;
     orig_policy = rcu_dereference(selinux_state.policy);
     orig_policydb = &orig_policy->policydb;
     orig_sidtab = orig_policy->sidtab;
-    policydb = &policy->policydb;
-    sidtab = policy->sidtab;
 #else
     ksu_lock_sepolicy_legacy();
 #endif
-    rc = string_to_context_struct(policydb, orig_policydb, sidtab, orig_sidtab, scontext2, scontext3, scontext_len,
+
+    // parse both policies together
+    orig_rc = -EINVAL;
+    rc = string_to_context_struct(policydb, orig_policydb, sidtab, orig_sidtab, scontext2, scontext, scontext_len,
                                   &context, &orig_context, def_sid, &orig_rc);
-    if (!rc) {
+    if (rc)
+        goto out_unlock;
+
+        // update backup sidtab first
 #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
-        rc = context_add_hash(policydb, &context);
+    rc = context_add_hash(policydb, &context);
+    if (!rc)
 #endif
-        if (!rc)
-            rc = sidtab_context_to_sid(sidtab, &context, sid);
-        // rc should not be frozen
-        context_destroy(&context);
-        // removed: if (rc == -ESTALE)
-        if (!orig_rc) {
-#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
-            orig_rc = context_add_hash(orig_policydb, &orig_context);
-#endif
-            if (!orig_rc) {
-                // sync to global sidtab
-                orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
-                if (orig_sid_p)
-                    *orig_sid_p = orig_sid;
-            }
+        rc = sidtab_context_to_sid(sidtab, &context, sid);
+    context_destroy(&context);
+    if (rc) {
+        if (!orig_rc)
             context_destroy(&orig_context);
-        }
+        // backup sidtab is not reloaded
+        orig_rc = rc;
+        goto out_unlock;
     }
+
+    if (orig_rc)
+        goto out_unlock;
+
+        // only sync valid contexts
+        // sync to live sidtab
+#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+    orig_rc = context_add_hash(orig_policydb, &orig_context);
+#endif
+    if (!orig_rc)
+        orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
+    context_destroy(&orig_context);
+    if (!orig_rc && orig_sid_p)
+        *orig_sid_p = orig_sid;
+    if (orig_rc == -ESTALE) {
+        // retry after live policy reload
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+        rcu_read_unlock();
+#else
+        ksu_unlock_sepolicy_legacy();
+#endif
+        memcpy(scontext2, scontext, scontext_len);
+        scontext2[scontext_len] = '\0';
+        goto retry;
+    }
+out_unlock:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     rcu_read_unlock();
 #else
@@ -1307,9 +1446,7 @@ static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct si
 #endif
     if (orig_rc_p)
         *orig_rc_p = orig_rc;
-    kfree(scontext3);
     kfree(scontext2);
-    kfree(str);
     return rc;
 }
 

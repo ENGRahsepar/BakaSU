@@ -12,6 +12,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import org.bakasu.bakasu.data.packageinfo.InstalledPackageRepository
 import org.bakasu.bakasu.data.webui.WebUiRepository
+import org.bakasu.bakasu.ui.webui.file.KsuIO
+import org.bakasu.bakasu.ui.webui.pm.KsuPm
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -186,6 +188,7 @@ class WebViewInterface(
         return currentModuleInfo.toString()
     }
 
+    @Deprecated("Use ksu.pm().listPackages() instead")
     @JavascriptInterface
     fun listPackages(type: String): String {
         val packageNames = packageRepository.packages.value
@@ -206,6 +209,7 @@ class WebViewInterface(
         return jsonArray.toString()
     }
 
+    @Deprecated("Use ksu.pm().getPackagesInfo() instead")
     @JavascriptInterface
     fun getPackagesInfo(packageNamesJson: String): String {
         val packageNames = JSONArray(packageNamesJson)
@@ -236,6 +240,16 @@ class WebViewInterface(
     @JavascriptInterface
     fun exit() {
         state.requestExit()
+    }
+
+    @JavascriptInterface
+    fun io() = KsuIO
+
+    @JavascriptInterface
+    fun pm() = KsuPm(packageRepository)
+
+    fun destroy() {
+        KsuIO.destroy()
     }
 }
 

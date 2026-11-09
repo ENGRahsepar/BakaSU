@@ -11,6 +11,9 @@
 #include <linux/stat.h>
 #include <linux/namei.h>
 #include <linux/kernel.h> // for container_of in UL
+#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+#include <linux/susfs.h>
+#endif
 
 #include "policy/allowlist.h"
 #include "manager/apk_sign.h"
@@ -360,6 +363,10 @@ out:
         kfree(np);
     }
     revert_creds(old_cred);
+#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+    // Refresh after tracking completes, including deferred scans.
+    susfs_parse_priority_app_strings();
+#endif
 }
 
 void track_throne(unsigned int flags)
